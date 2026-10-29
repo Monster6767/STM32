@@ -208,8 +208,37 @@ else
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* USER CODE END WHILE */
+    uint8_t id = 0;
 
+    spi_status = ICM_ReadWhoAmI(&id);
+
+    if (spi_status == HAL_OK)
+    {
+        spi_error_code = HAL_SPI_ERROR_NONE;
+        who_am_i = id;
+
+        if (id == 0x3B)
+        {
+            ++spi_ok_count;
+            test_stage = 3;
+        }
+        else
+        {
+            ++id_bad_count;
+            test_stage = 4;
+        }
+    }
+    else
+    {
+        spi_error_code = HAL_SPI_GetError(&hspi1);
+        ++spi_error_count;
+        test_stage = 5;
+    }
+
+    /* 每隔约 100 ms 读取一次 */
+    HAL_Delay(100);
+
+    /* USER CODE END WHILE */
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
