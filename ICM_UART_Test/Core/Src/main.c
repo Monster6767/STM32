@@ -490,7 +490,7 @@ static void FormatMilli(int32_t value, char *text, size_t size)
 }
 
 
-/* 以中文说明输出一组六轴数据 */
+/* 输出一组六轴数据 */
 static void ICM_SendSixAxisUART(void)
 {
     char message[384];
@@ -595,6 +595,7 @@ int main(void)
   MX_SPI1_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+
   /* 空闲时不选中 ICM */
   HAL_GPIO_WritePin(
       IMU_CS_GPIO_Port, IMU_CS_Pin, GPIO_PIN_SET
@@ -630,39 +631,83 @@ int main(void)
       "六轴数据实时显示：加速度单位 g，角速度单位 度/秒\r\n";
 
   UART_SendText(header, sizeof(header) - 1U);
+
+  /* 完成初始化后，才开始统计 */
+  uint32_t last_report_ms = HAL_GetTick();
+  uint32_t last_sample_count = sample_count;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    int result = ICM_ReadSixAxis();
+    uint8_t status = 0;
 
-    if (result == 1)
+    /* 先读取数据就绪状态 */
+    if (ICM_ReadRegs(0x2DU, &status, 1) == HAL_OK)
     {
-        ++sample_count;
+        if ((status & 0x08U) != 0U)
+        {
+            /* 确认有新数据后，再读取六轴 */
+            int result = ICM_ReadSixAxis();
 
-        /* 本次数据有效，发送一行 CSV */
+            if (result == 1)
+            {
+                ++sample_count;
+            }
+            else if (result == 0)
+            {
+                ++read_error_count;
+            }
+            else
+            {
+                ++invalid_sample_count;
+            }
+        }
+    }
+    /* 每次循环都重新获取时间 */
+    uint32_t now_ms = HAL_GetTick();
+    uint32_t elapsed_ms = now_ms - last_report_ms;
+    /* 每隔约 1 秒统计、发送一次 */
+    if (elapsed_ms >= 1000U)
+    {
+        /* 先保存当前计数，作为本次统计的结束位置 */
+        uint32_t current_count = sample_count;
+
+        /* 本次统计窗口内成功采集了多少组 */
+        uint32_t interval_count =
+            current_count - last_sample_count;
+
+        /* 根据实际统计时间，换算成每秒采样次数 */
+        uint32_t rate_hz =
+            interval_count * 1000U / elapsed_ms;
+
+        char message[48];
+
+        /* 只输出数字：本次采集组数,平均采集频率 */
+        int length = snprintf(
+            message,
+            sizeof(message),
+            "%lu,%lu\r\n",
+            (unsigned long)interval_count,
+            (unsigned long)rate_hz
+        );
+
+        /* 更新下次统计的起点 */
+        last_sample_count = current_count;
+        last_report_ms = now_ms;
         ICM_SendSixAxisUART();
-    }
-    else if (result == 0)
-    {
-        ++read_error_count;
-        ICM_SendDiagnostic("SPI READ FAILED");
-    }
-    else
-    {
-        ++invalid_sample_count;
-        ICM_SendDiagnostic("INVALID SAMPLE");
-    }
 
-    /*
-    * 约每秒显示 10 组。
-    * 周期还包括读取和串口发送耗时，
-    * 所以不是严格的 100 ms 定时采样。
-    */
-    HAL_Delay(500);
-
+        if (length > 0 && length < (int)sizeof(message))
+        {
+            HAL_UART_Transmit(
+                &huart2,
+                (uint8_t *)message,
+                (uint16_t)length,
+                100
+            );
+        }
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
