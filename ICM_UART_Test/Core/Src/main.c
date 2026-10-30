@@ -330,23 +330,23 @@ static int ICM_InitSixAxis(void)
     }
 
     /*
-     * 步骤 5：陀螺仪 ±2000 °/s，100 Hz。
-     * 0x08 = 0000 1000。
+     * 步骤 5：陀螺仪 ±2000 °/s，1000 Hz。
+     * 0x06 = 0000 0110。
      */
     imu_init_step = 5;
 
-    if (!ICM_WriteCheck(ICM_GYRO_CONFIG0, 0x08))
+    if (!ICM_WriteCheck(ICM_GYRO_CONFIG0, 0x06))
     {
         return 0;
     }
 
     /*
-     * 步骤 6：加速度 ±4 g，100 Hz。
-     * 0x68 = 0110 1000。
+     * 步骤 6：加速度 ±4 g，1000 Hz。
+     * 0x66 = 0110 0110。
      */
     imu_init_step = 6;
 
-    if (!ICM_WriteCheck(ICM_ACCEL_CONFIG0, 0x68))
+    if (!ICM_WriteCheck(ICM_ACCEL_CONFIG0, 0x66))
     {
         return 0;
     }
@@ -517,17 +517,10 @@ static void ICM_SendSixAxisUART(void)
     FormatMilli(gy, gy_text, sizeof(gy_text));
     FormatMilli(gz, gz_text, sizeof(gz_text));
 
-    int length = snprintf(
-        message,
-        sizeof(message),
-        "时间：%lu ms\r\n"
-        "加速度：X=%s g，Y=%s g，Z=%s g\r\n"
-        "角速度：X=%s 度/秒，Y=%s 度/秒，Z=%s 度/秒\r\n"
-        "------------------------------------------------\r\n",
-        (unsigned long)sample_time_ms,
-        ax_text, ay_text, az_text,
-        gx_text, gy_text, gz_text
-    );
+    int length = snprintf(message, sizeof(message),
+         "%s %s %s\r\n%s %s %s\r\n",
+         ax_text, ay_text, az_text,
+         gx_text, gy_text, gz_text);
 
     if (length > 0 && length < (int)sizeof(message))
     {
