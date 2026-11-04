@@ -15,11 +15,12 @@
 #include "spi.h"   /* CubeMX 生成，提供 hspi1。 */
 #include "usart.h" /* CubeMX 生成，提供 huart2。 */
 #include "tim.h"   /* CubeMX 生成，提供 htim3。 */
+#include "ano_protocol.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
 
-#define CALIBRATION_COUNT 2000U /* 1000Hz 理想连续采集时约2秒，并非固定墙钟时长。 */
+#define CALIBRATION_COUNT 5000U /* 1000Hz 理想连续采集时约2秒，并非固定墙钟时长。 */
 #define DEG2RAD 0.01745329252f  /* pi/180：角速度从度/秒转换为 rad/s。 */
 
 /* 全局可观察状态。volatile 用于让编译器保留实际读取，不用于解决多线程同步。 */
@@ -155,63 +156,93 @@ void App_Init(void)
     previous_text_ms = previous_report_ms;
 }
 
+/*
+ * 功能：约每 20 ms 向匿名地面站发送一帧姿态数据。
+ *
+ * 1000 Hz：
+ *   传感器读取与四元数更新频率。
+ *
+ * 50 Hz：
+ *   欧拉角转换与地面站数据显示频率。
+ *
+ * 两者相互独立，不需要每个采样点都向电脑发一帧。
+ */
 static void send_status(uint32_t now_ms)
 {
-    /* 正常姿态输出最多每20ms一次，即50Hz。
-     * UART忙时直接跳过，不在这里等待，不影响下一轮采集。
-     * 无符号相减可兼容HAL毫秒计数器的正常回绕。 */
-    if ((uint32_t)(now_ms - previous_text_ms) < 20U || Telemetry_IsBusy()) {
+    /*
+     * 只在静止标定完成后发送姿态帧。
+     *
+     * state：
+     *   0：正在标定
+     *   1：正常运行
+     *   2：传感器初始化失败
+     *   3：定时器启动失败
+     *
+     * 此版本不再发送 STATE/ATT 文本，
+     * 让串口用于输出匿名协议二进制姿态帧。
+     * 标定和故障状态通过 Watch 中的 app_status 查看。
+     */
+    if (app_status.state != 1U) {
         return;
     }
+
+    /*
+     * 20 ms 对应约 50 Hz。
+     * 无符号相减可以处理 HAL 毫秒计数器的正常回绕。
+     */
+    if ((uint32_t)(now_ms - previous_text_ms) < 20U) {
+        return;
+    }
+
+    /*
+     * 串口忙就跳过本轮，不等待、不覆盖上一帧。
+     * 保证 App_Run() 能继续回到采集流程。
+     */
+    if (Telemetry_IsBusy()) {
+        return;
+    }
+
     previous_text_ms = now_ms;
 
-    /* 临时格式化数组在函数返回后失效没关系：Telemetry_Send会复制内容。
-     * 它不能直接作为HAL_UART_Transmit_IT的长期发送缓冲区。 */
-    char text[240];
-    int length;
-    if (app_status.state == 1) {
-        IMU_Angles angles;
+    /*
+     * 从最新四元数计算 roll、pitch、yaw。
+     * 角度单位是度，不是毫度，也不是弧度。
+     */
+    IMU_Angles angles;
 
-        /* 三角函数只在显示频率执行，内部四元数仍逐样本更新。
-         * 因此Watch里的欧拉角约50Hz变化，不代表姿态融合只有50Hz。 */
-        IMU_GetAngles(&attitude, &angles);
-        app_status.roll = angles.roll;
-        app_status.pitch = angles.pitch;
-        app_status.yaw = angles.yaw;
+    IMU_GetAngles(&attitude, &angles);
 
-        /* 避免printf浮点格式化：角度乘1000并四舍五入，输出整数毫度。
-         * ATT字段：roll_mdeg,pitch_mdeg,yaw_mdeg,采集Hz,解算Hz,gap数,最大融合us。
-         * 对应%ld/%lu显式转换long，避免不同C平台整数类型差异导致格式错误。 */
-        length = snprintf(text, sizeof(text),
-            "ATT,%ld,%ld,%ld,%lu,%lu,%lu,%lu\r\n",
-            (long)lroundf(angles.roll * 1000.0f),
-            (long)lroundf(angles.pitch * 1000.0f),
-            (long)lroundf(angles.yaw * 1000.0f),
-            (unsigned long)app_status.sample_hz,
-            (unsigned long)app_status.update_hz,
-            (unsigned long)app_status.timing_gaps,
-            (unsigned long)app_status.max_fusion_us);
-    } else {
-        /* 标定/失败时输出诊断，降到每200ms一次，避免无意义刷屏。
-         * 函数内static变量跨调用保留，但只属于本函数。 */
-        static uint32_t last_note_ms;
-        if ((uint32_t)(now_ms - last_note_ms) < 200U) {
-            return;
-        }
-        last_note_ms = now_ms;
-        length = snprintf(text, sizeof(text),
-            "STATE,%u,CAL,%lu,STEP,%u,ID,%02X\r\n",
-            (unsigned)app_status.state,
-            (unsigned long)app_status.calibration_samples,
-            (unsigned)app_status.init_step,
-            (unsigned)app_status.who_am_i);
-    }
+    /* 保留 Watch 中的角度，方便与地面站显示对照。 */
+    app_status.roll  = angles.roll;
+    app_status.pitch = angles.pitch;
+    app_status.yaw   = angles.yaw;
 
-    /* snprintf返回“本来需要的字符数”，不含末尾0。
-     * >=数组大小说明内容被截断，不发送这类不完整帧。 */
-    if (length > 0 && length < (int)sizeof(text)) {
-        (void)Telemetry_Send(text, (uint16_t)length);
-    }
+    /*
+     * 把角度交给协议模块。
+     *
+     * 高度：
+     *   没有测量，传 0 cm。
+     *
+     * 飞行模式：
+     *   当前只是姿态显示测试，传 0。
+     *
+     * 锁定状态：
+     *   传 0，表示锁定。
+     *
+     * 角度乘 100 在 ANO_SendStatus() 内部完成，
+     * 这里必须直接传原始的“度”。
+     *
+     * 返回失败时本次显示帧直接跳过，
+     * 不影响下一组传感器数据的处理。
+     */
+    (void)ANO_SendStatus(
+        angles.roll,
+        angles.pitch,
+        angles.yaw,
+        0,
+        0,
+        0
+    );
 }
 
 void App_Run(void)

@@ -48,6 +48,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/icm40609.c
     Core/Src/imu.c
     Core/Src/telemetry.c
+    Core/Src/ano_protocol.c
 )
 
 # Add include paths
