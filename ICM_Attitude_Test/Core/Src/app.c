@@ -22,6 +22,10 @@
 
 #define CALIBRATION_COUNT 5000U /* 1000Hz 理想连续采集时约2秒，并非固定墙钟时长。 */
 #define DEG2RAD 0.01745329252f  /* pi/180：角速度从度/秒转换为 rad/s。 */
+/* 预热等待时间，单位毫秒。
+ * 30秒是起步测试值，不代表已经验证温度完全稳定。
+ */
+#define IMU_WARMUP_MS 30000U
 
 /* 全局可观察状态。volatile 用于让编译器保留实际读取，不用于解决多线程同步。 */
 volatile App_Status app_status;
@@ -49,6 +53,11 @@ static uint32_t previous_text_ms;
 static uint32_t previous_samples;
 static uint32_t previous_updates;
 static uint8_t have_previous;     /* 第一组运行数据仅建立时间基准，不做积分。 */
+/* 记录传感器开启后的预热起点，使用HAL毫秒时基。 */
+static uint32_t warmup_start_ms;
+
+/* 0：尚未完成预热；1：预热结束，可以收集标定样本。 */
+static uint8_t warmup_done;
 
 static uint32_t micros_now(void)
 {
@@ -154,6 +163,12 @@ void App_Init(void)
     clock_us = 0;
     previous_report_ms = HAL_GetTick();
     previous_text_ms = previous_report_ms;
+    /*
+    * ICM40609_Init() 已经开启了加速度计和陀螺仪。
+    * 从这里开始计算额外的预热时间。
+    */
+    warmup_start_ms = HAL_GetTick();
+    warmup_done = 0U;
 }
 
 /*
@@ -263,9 +278,39 @@ void App_Run(void)
         if (result == 1) {
             uint32_t sample_us = micros_now();
             ++app_status.samples;
-            if (app_status.state == 0) {
+            /*if (app_status.state == 0) {
                 calibrate(&sample);
+            } else { */
+            if (app_status.state == 0) {
+            /*
+            * state仍保持0，表示尚未进入正常姿态解算。
+            * 通过warmup_done区分“预热”和“静止标定”。
+            *
+            * 预热期间仍然执行外面的ICM40609_Poll()，
+            * 持续读取数据，也让微秒计时扩展继续正常运行。
+            */
+            if (warmup_done == 0U) {
+
+                uint32_t elapsed_ms = HAL_GetTick() - warmup_start_ms;
+
+                if (elapsed_ms >= IMU_WARMUP_MS) {
+                    /*
+                    * 到达30秒后允许标定。
+                    * 本次样本不参加标定，从下一组有效数据开始累计。
+                    */
+                    warmup_done = 1U;
+                }
+
             } else {
+
+                /*
+                * 预热完成后，才开始累计5000组静止样本。
+                * 原有calibrate()会处理静止检查、零偏计算和姿态初始化。
+                */
+                calibrate(&sample);
+            }
+
+        } else { 
                 /* 读取完成时间差近似采样间隔，不是传感器硬件时间戳。
                  * 轮询抖动和CPU调度会影响它，本阶段接受这一限制。 */
                 uint32_t elapsed_us = sample_us - previous_sample_us;
