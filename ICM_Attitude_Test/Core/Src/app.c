@@ -59,6 +59,12 @@ static uint32_t warmup_start_ms;
 /* 0：尚未完成预热；1：预热结束，可以收集标定样本。 */
 static uint8_t warmup_done;
 
+/*
+ * 标定完成时的系统时间，单位ms。
+ * 之后的日志时间均相对于“标定完成”这个时刻。
+ */
+static uint32_t attitude_start_ms;
+
 static uint32_t micros_now(void)
 {
     /* 前提：TIM3输入64MHz、PSC=63、ARR=65535，已用 Base_Start 启动。
@@ -134,7 +140,12 @@ static void calibrate(const ICM40609_Sample *s)
         app_status.bias_dps[i] = bias[i];
     }
     IMU_Init(&attitude, average_accel);
+
     have_previous = 0;
+
+    /* 在开始正常运行前记录时间起点。 */
+    attitude_start_ms = HAL_GetTick();
+
     app_status.state = 1;
 }
 
@@ -172,47 +183,25 @@ void App_Init(void)
 }
 
 /*
- * 功能：约每 20 ms 向匿名地面站发送一帧姿态数据。
+ * 日志格式：
+ * elapsed_ms,roll_mdeg,pitch_mdeg,yaw_mdeg,temp_mC
  *
- * 1000 Hz：
- *   传感器读取与四元数更新频率。
+ * temp_mC表示千分之一摄氏度：
+ * 28560对应28.560℃。
  *
- * 50 Hz：
- *   欧拉角转换与地面站数据显示频率。
- *
- * 两者相互独立，不需要每个采样点都向电脑发一帧。
+ * 这个小数位数只是输出格式，不代表温度测量有0.001℃精度。
  */
 static void send_status(uint32_t now_ms)
 {
-    /*
-     * 只在静止标定完成后发送姿态帧。
-     *
-     * state：
-     *   0：正在标定
-     *   1：正常运行
-     *   2：传感器初始化失败
-     *   3：定时器启动失败
-     *
-     * 此版本不再发送 STATE/ATT 文本，
-     * 让串口用于输出匿名协议二进制姿态帧。
-     * 标定和故障状态通过 Watch 中的 app_status 查看。
-     */
     if (app_status.state != 1U) {
         return;
     }
 
-    /*
-     * 20 ms 对应约 50 Hz。
-     * 无符号相减可以处理 HAL 毫秒计数器的正常回绕。
-     */
+    /* 约50Hz输出，1000Hz采集和融合继续独立运行。 */
     if ((uint32_t)(now_ms - previous_text_ms) < 20U) {
         return;
     }
 
-    /*
-     * 串口忙就跳过本轮，不等待、不覆盖上一帧。
-     * 保证 App_Run() 能继续回到采集流程。
-     */
     if (Telemetry_IsBusy()) {
         return;
     }
@@ -220,44 +209,42 @@ static void send_status(uint32_t now_ms)
     previous_text_ms = now_ms;
 
     /*
-     * 从最新四元数计算 roll、pitch、yaw。
-     * 角度单位是度，不是毫度，也不是弧度。
+     * 主循环内取快照。
+     * 温度是最近一次成功采集的值；
+     * 此时间是MCU记录时间，不是传感器内部采样时间戳。
      */
-    IMU_Angles angles;
+    uint32_t snapshot_ms = HAL_GetTick();
+    float temperature_c = sample.temperature_c;
 
+    IMU_Angles angles;
     IMU_GetAngles(&attitude, &angles);
 
-    /* 保留 Watch 中的角度，方便与地面站显示对照。 */
-    app_status.roll  = angles.roll;
+    app_status.roll = angles.roll;
     app_status.pitch = angles.pitch;
-    app_status.yaw   = angles.yaw;
+    app_status.yaw = angles.yaw;
+
+    uint32_t elapsed_ms = snapshot_ms - attitude_start_ms;
+
+    char text[160];
 
     /*
-     * 把角度交给协议模块。
-     *
-     * 高度：
-     *   没有测量，传 0 cm。
-     *
-     * 飞行模式：
-     *   当前只是姿态显示测试，传 0。
-     *
-     * 锁定状态：
-     *   传 0，表示锁定。
-     *
-     * 角度乘 100 在 ANO_SendStatus() 内部完成，
-     * 这里必须直接传原始的“度”。
-     *
-     * 返回失败时本次显示帧直接跳过，
-     * 不影响下一组传感器数据的处理。
+     * 全部使用整数格式，避免浮点printf。
+     * 前四列与之前相同，第五列增加温度。
      */
-    (void)ANO_SendStatus(
-        angles.roll,
-        angles.pitch,
-        angles.yaw,
-        0,
-        0,
-        0
+    int length = snprintf(
+        text,
+        sizeof(text),
+        "%lu,%ld,%ld,%ld,%ld\r\n",
+        (unsigned long)elapsed_ms,
+        (long)lroundf(angles.roll * 1000.0f),
+        (long)lroundf(angles.pitch * 1000.0f),
+        (long)lroundf(angles.yaw * 1000.0f),
+        (long)lroundf(temperature_c * 1000.0f)
     );
+
+    if (length > 0 && length < (int)sizeof(text)) {
+        (void)Telemetry_Send(text, (uint16_t)length);
+    }
 }
 
 void App_Run(void)

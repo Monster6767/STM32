@@ -14,13 +14,19 @@ typedef struct {
     HAL_StatusTypeDef last_status; /* 最近一次 SPI 事务状态；不代表回读值一定正确。 */
 } ICM40609_t;
 
-/* 一组六轴样本。下标 0/1/2 始终对应 X/Y/Z。
- * 原始值保留用于排查通信、量程和字节序；算法使用物理量。 */
+/*
+ * 一组传感器样本。
+ * 数组下标0、1、2分别表示X、Y、Z。
+ */
 typedef struct {
-    int16_t accel_raw[3]; /* 加速度原始计数，带符号 16 位。 */
-    int16_t gyro_raw[3];  /* 陀螺仪原始计数，带符号 16 位。 */
-    float accel_g[3];     /* 单位 g；当前配置为 +/-4 g。 */
-    float gyro_dps[3];    /* 单位 度/秒；当前配置为 +/-2000 度/秒。 */
+    int16_t accel_raw[3]; /* 加速度原始值 */
+    int16_t gyro_raw[3];  /* 角速度原始值 */
+
+    float accel_g[3];     /* 加速度，单位g */
+    float gyro_dps[3];    /* 角速度，单位度/秒 */
+
+    int16_t temperature_raw; /* 温度寄存器的16位有符号原始值 */
+    float temperature_c;     /* 芯片内部温度，单位摄氏度 */
 } ICM40609_Sample;
 
 /* 调用前先填写 spi、cs_port、cs_pin，且相关外设必须已初始化。

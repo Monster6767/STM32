@@ -22,6 +22,8 @@
 #define REG_ACCEL_CONFIG0   0x50U /* 加速度量程与输出数据率。 */
 #define REG_WHO_AM_I        0x75U /* 身份值，本型号应读到 0x3B。 */
 #define REG_BANK_SEL        0x76U /* 寄存器 Bank 选择。 */
+/* 温度高字节地址，后面依次是温度低字节和六轴数据。 */
+#define REG_TEMP_DATA1 0x1DU
 
 /* 单次事务超时，不是采样周期。正常 2 MHz SPI 事务只需很短时间。
  * 发生超时仍可能丢样，但不采用原先 100 ms 的长等待。 */
@@ -31,9 +33,14 @@ static HAL_StatusTypeDef read_regs(ICM40609_t *d, uint8_t reg,
                                     uint8_t *data, uint8_t count)
 {
     /* 最多 1 个命令字节 + 12 个数据字节，不是 FIFO 批量读接口。 */
-    uint8_t tx[13] = {0};
-    uint8_t rx[13] = {0};
-    if (data == NULL || count == 0 || count > 12) {
+    /*
+    * 1字节读命令 + 最多14字节数据。
+    * 原来的13字节数组只能支持12字节数据，必须一起扩容。
+    */
+    uint8_t tx[15] = {0};
+    uint8_t rx[15] = {0};
+
+    if (data == NULL || count == 0 || count > 14) {
         return HAL_ERROR;
     }
 
@@ -192,43 +199,71 @@ static int16_t to_i16(uint8_t high, uint8_t low)
 int ICM40609_Poll(ICM40609_t *d, ICM40609_Sample *s)
 {
     uint8_t status = 0;
-    uint8_t data[12];
+    uint8_t data[14];
     int16_t values[6];
 
-    /* 第一步只查就绪。无新数据是正常返回，不重复融合旧样本。 */
+    /* 先检查是否有新六轴数据。 */
     if (read_regs(d, REG_INT_STATUS, &status, 1) != HAL_OK) {
         return -1;
     }
+
     if ((status & 0x08U) == 0U) {
         return 0;
     }
 
-    /* 0x1F 起连续读取：AX高低、AY高低、AZ高低、GX高低、GY高低、GZ高低。
-     * 这里读取最新寄存器，不是读取历史队列；延误时可能遗漏中间样本。 */
-    if (read_regs(d, REG_ACCEL_DATA_X1, data, 12) != HAL_OK) {
+    /*
+     * 从0x1D开始连续读取14字节：
+     *
+     * data[0..1]   温度
+     * data[2..3]   加速度X
+     * data[4..5]   加速度Y
+     * data[6..7]   加速度Z
+     * data[8..9]   角速度X
+     * data[10..11] 角速度Y
+     * data[12..13] 角速度Z
+     *
+     * 当前传感器配置为高字节在前。
+     */
+    if (read_regs(d, REG_TEMP_DATA1, data, 14) != HAL_OK) {
         return -1;
     }
 
-    /* 先解析到临时数组，所有分量均有效后才整体更新调用方的样本。 */
+    /* 六轴数据现在从data[2]开始，而不是原来的data[0]。 */
     for (unsigned i = 0; i < 6; ++i) {
-        values[i] = to_i16(data[i * 2], data[i * 2 + 1]);
+        unsigned offset = 2U + i * 2U;
+
+        values[i] = to_i16(data[offset], data[offset + 1U]);
+
+        /*
+         * 按当前六轴无效值配置检查。
+         * 不直接把该规则套用到温度字段。
+         */
         if (values[i] == INT16_MIN) {
-            /* 此判断依赖当前无效值策略，未来改 INTF_CONFIG0 时要一起核对。 */
             return -2;
         }
     }
 
+    /* 全部六轴有效后，再更新调用方的样本。 */
     for (unsigned i = 0; i < 3; ++i) {
         s->accel_raw[i] = values[i];
-        s->gyro_raw[i] = values[i + 3];
+        s->gyro_raw[i] = values[i + 3U];
 
-        /* +/-4 g 对应 32768 个正向计数，因此 8192 LSB/g。
-         * 若以后更改量程，必须同步修改这里的换算比例。 */
-        s->accel_g[i] = values[i] * (1.0f / 8192.0f);
+        /* 当前加速度量程为±4g。 */
+        s->accel_g[i] = values[i] / 8192.0f;
 
-        /* +/-2000 度/秒：每计数对应 2000/32768 度/秒。
-         * 这里只得到角速度，不是角度；rad/s 换算在 app.c。 */
-        s->gyro_dps[i] = values[i + 3] * (2000.0f / 32768.0f);
+        /* 当前角速度量程为±2000度/秒。 */
+        s->gyro_dps[i] =
+            values[i + 3U] * (2000.0f / 32768.0f);
     }
+
+    /*
+     * 温度原始值是16位有符号数。
+     * 使用传感器寄存器温度公式，不使用FIFO的8位温度公式。
+     */
+    s->temperature_raw = to_i16(data[0], data[1]);
+
+    s->temperature_c =
+        (float)s->temperature_raw / 132.48f + 25.0f;
+
     return 1;
 }
